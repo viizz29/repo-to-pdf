@@ -9,7 +9,7 @@ npm -r requirements.txt
 create a postgres database
 update the database details in the .env file
 
-alembic upgrade head
+alembic upgrade headc
 python app/seed_users.py
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 http://localhost:8000/docs

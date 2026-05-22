@@ -11,6 +11,9 @@ from app.modules.files.router import router as files_router
 from app.modules.jobs.router import router as jobs_router
 from app.modules.test.router import router as test_router
 
+import logging
+logging.basicConfig(level=logging.DEBUG)
+
 
 DOCS_URL = "/docs"
 API_PREFIX = "/api"

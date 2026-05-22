@@ -35,6 +35,7 @@ def start_job_processing(job_id: int) -> None:
 
 
 def process_job(job_id: int) -> None:
+    logger.info("Starting processing job %s", job_id)
     db = SessionLocal()
     try:
         job = db.query(Job).filter(Job.id == job_id).first()
