@@ -327,7 +327,7 @@ def _build_pdf_from_repository(repo_url: str) -> bytes:
         readme_path = _find_readme(extract_dir)
         markdown_text = readme_path.read_text(encoding="utf-8", errors="replace")
         readme_urls = _extract_unique_urls(markdown_text)
-        linked_pages = _fetch_html_pages(readme_urls)
+        linked_pages = [] # _fetch_html_pages(readme_urls)
         python_files = _find_python_files(repo_root)
         markdown_files = _find_markdown_files(repo_root, readme_path)
         text_files = _find_text_files(repo_root)
@@ -472,6 +472,9 @@ def _extract_unique_urls(markdown_text: str) -> list[str]:
 def _fetch_html_pages(urls: list[str]) -> list[dict[str, str]]:
     pages = []
     for url in urls:
+
+        if "github.com" in url:
+            continue
         page = _fetch_html_page(url)
         if page is not None:
             pages.append(page)
