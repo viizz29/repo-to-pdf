@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import io
 import logging
 import re
 import threading
@@ -14,6 +15,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from markdown import markdown
+from pypdf import PdfReader, PdfWriter
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import PythonLexer
@@ -329,7 +331,7 @@ def _build_pdf_from_repository(repo_url: str) -> bytes:
         markdown_files = _find_markdown_files(repo_root, readme_path)
         text_files = _find_text_files(repo_root)
         repo_name = _repo_name_from_url(repo_url)
-        return _render_repository_pdf(
+        pdf_parts = _build_repository_pdf_parts(
             repo_name=repo_name,
             repo_url=repo_url,
             markdown_text=markdown_text,
@@ -340,6 +342,7 @@ def _build_pdf_from_repository(repo_url: str) -> bytes:
             markdown_files=markdown_files,
             text_files=text_files,
         )
+        return _merge_pdf_parts(pdf_parts)
 
 
 def _build_archive_url(repo_url: str) -> str:
@@ -502,7 +505,7 @@ def _fetch_html_page(url: str) -> dict[str, str] | None:
     }
 
 
-def _render_repository_pdf(
+def _build_repository_pdf_parts(
     repo_name: str,
     repo_url: str,
     markdown_text: str,
@@ -512,7 +515,7 @@ def _render_repository_pdf(
     python_files: list[Path],
     markdown_files: list[Path],
     text_files: list[Path],
-) -> bytes:
+) -> list[bytes]:
     toc_entries = [
         {"id": "readme", "label": "README", "kind": "Documentation"},
         *(
@@ -546,7 +549,7 @@ def _render_repository_pdf(
         ],
     ]
 
-    html_document = f"""<!DOCTYPE html>
+    intro_html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -557,32 +560,49 @@ def _render_repository_pdf(
   <main class="document">
     {_build_cover_page(repo_name, repo_url, len(python_files))}
     {_build_table_of_contents(toc_entries)}
-    {_build_readme_section(markdown_text, asset_root)}
-    {_build_linked_pages_section(linked_pages)}
-    {_build_markdown_sections(repo_root, markdown_files)}
-    {_build_text_sections(repo_root, text_files)}
-    {_build_python_sections(repo_root, python_files)}
   </main>
 </body>
 </html>
 """
-    main_document = HTML(string=html_document, base_url=str(asset_root)).render(stylesheets=[README_PDF_CSS])
-    all_pages = list(main_document.pages)
+    pdf_parts = [_render_pdf_html(intro_html, asset_root)]
+    pdf_parts.append(_render_pdf_html(_build_readme_section(markdown_text), asset_root))
+
+    if linked_pages:
+        pdf_parts.append(_render_pdf_html(_build_linked_pages_section(linked_pages), asset_root))
 
     for index, page in enumerate(linked_pages, start=1):
-        divider_document = HTML(
-            string=_build_linked_page_divider(page["title"], page["url"], index),
-            base_url=page["url"],
-        ).render(stylesheets=[README_PDF_CSS])
-        all_pages.extend(divider_document.pages)
-
+        pdf_parts.append(_render_pdf_html(_build_linked_page_divider(page["title"], page["url"], index), page["url"]))
         try:
-            linked_document = HTML(string=page["html"], base_url=page["url"]).render()
-            all_pages.extend(linked_document.pages)
+            pdf_parts.append(HTML(string=page["html"], base_url=page["url"]).write_pdf())
         except Exception:
             logger.warning("Failed to render linked HTML page %s", page["url"], exc_info=True)
 
-    return main_document.copy(all_pages).write_pdf()
+    for index, path in enumerate(markdown_files, start=1):
+        pdf_parts.append(_render_markdown_file_pdf(repo_root, path, index))
+
+    for index, path in enumerate(text_files, start=1):
+        pdf_parts.append(_render_text_file_pdf(repo_root, path, index))
+
+    for index, path in enumerate(python_files, start=1):
+        pdf_parts.append(_render_python_file_pdf(repo_root, path, index))
+
+    return pdf_parts
+
+
+def _render_pdf_html(html_document: str, base_url: Path | str) -> bytes:
+    return HTML(string=html_document, base_url=str(base_url)).write_pdf(stylesheets=[README_PDF_CSS])
+
+
+def _merge_pdf_parts(pdf_parts: list[bytes]) -> bytes:
+    writer = PdfWriter()
+    for pdf_bytes in pdf_parts:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        for page in reader.pages:
+            writer.add_page(page)
+
+    output = io.BytesIO()
+    writer.write(output)
+    return output.getvalue()
 
 
 def _build_cover_page(repo_name: str, repo_url: str, python_file_count: int) -> str:
@@ -591,7 +611,7 @@ def _build_cover_page(repo_name: str, repo_url: str, python_file_count: int) -> 
   <p class="toc-kind">Repository Export</p>
   <h1>{html.escape(repo_name)}</h1>
   <p>{html.escape(repo_url)}</p>
-  <p>Includes README and {python_file_count} Python file(s).</p>
+  <p>Includes README and {python_file_count} Python file(s), plus extracted supporting files.</p>
 </section>
 """
 
@@ -599,16 +619,13 @@ def _build_cover_page(repo_name: str, repo_url: str, python_file_count: int) -> 
 def _build_table_of_contents(toc_entries: list[dict[str, str]]) -> str:
     items = []
     for entry in toc_entries:
-        item_id = html.escape(entry["id"])
         item_label = html.escape(entry["label"])
         item_kind = html.escape(entry["kind"])
         items.append(
             f"""
 <li>
-  <a href="#{item_id}">
-    <span class="toc-label">{item_label}</span>
-    <span class="toc-kind">{item_kind}</span>
-  </a>
+  <span class="toc-label">{item_label}</span>
+  <span class="toc-kind">{item_kind}</span>
 </li>
 """
         )
@@ -623,9 +640,10 @@ def _build_table_of_contents(toc_entries: list[dict[str, str]]) -> str:
 """
 
 
-def _build_readme_section(markdown_text: str, asset_root: Path) -> str:
+def _build_readme_section(markdown_text: str) -> str:
     rendered_markdown = _render_markdown_html(markdown_text)
-    return f"""
+    return _wrap_html_document(
+        f"""
 <section class="page-break" id="readme">
   <h1>README</h1>
   <p class="section-intro">Repository documentation rendered from <code>README.md</code>.</p>
@@ -634,6 +652,7 @@ def _build_readme_section(markdown_text: str, asset_root: Path) -> str:
   </div>
 </section>
 """
+    )
 
 
 def _build_linked_pages_section(linked_pages: list[dict[str, str]]) -> str:
@@ -641,20 +660,19 @@ def _build_linked_pages_section(linked_pages: list[dict[str, str]]) -> str:
         return ""
 
     items = []
-    for index, page in enumerate(linked_pages, start=1):
+    for page in linked_pages:
         items.append(
             f"""
 <li>
-  <a href="#linked-page-{index}">
-    <span class="toc-label">{html.escape(page["title"])}</span>
-    <span class="toc-kind">HTML Page</span>
-  </a>
+  <span class="toc-label">{html.escape(page["title"])}</span>
+  <span class="toc-kind">HTML Page</span>
   <div class="file-path">{html.escape(page["url"])}</div>
 </li>
 """
         )
 
-    return f"""
+    return _wrap_html_document(
+        f"""
 <section class="page-break" id="linked-pages">
   <h1>Linked HTML Pages</h1>
   <p class="section-intro">HTML pages referenced from <code>README.md</code> and rendered into this export.</p>
@@ -663,23 +681,22 @@ def _build_linked_pages_section(linked_pages: list[dict[str, str]]) -> str:
   </ol>
 </section>
 """
+    )
 
 
-def _build_markdown_sections(repo_root: Path, markdown_files: list[Path]) -> str:
-    sections = []
-    for index, path in enumerate(markdown_files, start=1):
-        relative_path = path.relative_to(repo_root).as_posix()
-        file_id = f"markdown-file-{index}"
-        content = path.read_text(encoding="utf-8", errors="replace")
-        rendered_markdown = _render_markdown_html(content)
-        sections.append(
+def _render_markdown_file_pdf(repo_root: Path, path: Path, index: int) -> bytes:
+    relative_path = path.relative_to(repo_root).as_posix()
+    content = path.read_text(encoding="utf-8", errors="replace")
+    rendered_markdown = _render_markdown_html(content)
+    return _render_pdf_html(
+        _wrap_html_document(
             f"""
-<section class="page-break divider-page">
+<section class="divider-page" id="markdown-file-{index}">
   <p class="toc-kind">Upcoming Markdown File</p>
   <h1>{html.escape(path.name)}</h1>
   <p class="file-path">{html.escape(relative_path)}</p>
 </section>
-<section class="page-break" id="{file_id}">
+<section class="page-break">
   <h1>{html.escape(path.name)}</h1>
   <p class="file-path">{html.escape(relative_path)}</p>
   <div class="markdown-body">
@@ -687,24 +704,23 @@ def _build_markdown_sections(repo_root: Path, markdown_files: list[Path]) -> str
   </div>
 </section>
 """
-        )
-    return "".join(sections)
+        ),
+        path.parent,
+    )
 
 
-def _build_text_sections(repo_root: Path, text_files: list[Path]) -> str:
-    sections = []
-    for index, path in enumerate(text_files, start=1):
-        relative_path = path.relative_to(repo_root).as_posix()
-        file_id = f"text-file-{index}"
-        content = path.read_text(encoding="utf-8", errors="replace")
-        sections.append(
+def _render_text_file_pdf(repo_root: Path, path: Path, index: int) -> bytes:
+    relative_path = path.relative_to(repo_root).as_posix()
+    content = path.read_text(encoding="utf-8", errors="replace")
+    return _render_pdf_html(
+        _wrap_html_document(
             f"""
-<section class="page-break divider-page">
+<section class="divider-page" id="text-file-{index}">
   <p class="toc-kind">Upcoming Text File</p>
   <h1>{html.escape(path.name)}</h1>
   <p class="file-path">{html.escape(relative_path)}</p>
 </section>
-<section class="page-break" id="{file_id}">
+<section class="page-break">
   <h1>{html.escape(path.name)}</h1>
   <p class="file-path">{html.escape(relative_path)}</p>
   <div class="codehilite">
@@ -712,32 +728,32 @@ def _build_text_sections(repo_root: Path, text_files: list[Path]) -> str:
   </div>
 </section>
 """
-        )
-    return "".join(sections)
+        ),
+        path.parent,
+    )
 
 
-def _build_python_sections(repo_root: Path, python_files: list[Path]) -> str:
-    sections = []
-    for index, path in enumerate(python_files, start=1):
-        relative_path = path.relative_to(repo_root).as_posix()
-        file_id = f"python-file-{index}"
-        source = path.read_text(encoding="utf-8", errors="replace")
-        highlighted = highlight(source, PythonLexer(), PYTHON_FORMATTER)
-        sections.append(
+def _render_python_file_pdf(repo_root: Path, path: Path, index: int) -> bytes:
+    relative_path = path.relative_to(repo_root).as_posix()
+    source = path.read_text(encoding="utf-8", errors="replace")
+    highlighted = highlight(source, PythonLexer(), PYTHON_FORMATTER)
+    return _render_pdf_html(
+        _wrap_html_document(
             f"""
-<section class="page-break divider-page">
+<section class="divider-page" id="python-file-{index}">
   <p class="toc-kind">Upcoming File</p>
   <h1>{html.escape(path.name)}</h1>
   <p class="file-path">{html.escape(relative_path)}</p>
 </section>
-<section class="page-break" id="{file_id}">
+<section class="page-break">
   <h1>{html.escape(path.name)}</h1>
   <p class="file-path">{html.escape(relative_path)}</p>
   {highlighted}
 </section>
 """
-        )
-    return "".join(sections)
+        ),
+        path.parent,
+    )
 
 
 def _render_markdown_html(markdown_text: str) -> str:
@@ -755,20 +771,28 @@ def _render_markdown_html(markdown_text: str) -> str:
 
 
 def _build_linked_page_divider(title: str, url: str, index: int) -> str:
+    return _wrap_html_document(
+        f"""
+<section class="divider-page" id="linked-page-{index}">
+  <p class="toc-kind">Upcoming Linked Page</p>
+  <h1>{html.escape(title)}</h1>
+  <p class="file-path">{html.escape(url)}</p>
+</section>
+"""
+    )
+
+
+def _wrap_html_document(body: str) -> str:
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{html.escape(title)}</title>
+  <title>Repository Export</title>
 </head>
 <body>
   <main>
-    <section class="page-break divider-page" id="linked-page-{index}">
-      <p class="toc-kind">Upcoming Linked Page</p>
-      <h1>{html.escape(title)}</h1>
-      <p class="file-path">{html.escape(url)}</p>
-    </section>
+    {body}
   </main>
 </body>
 </html>

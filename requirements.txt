@@ -12,3 +12,4 @@ hashids
 markdown
 weasyprint
 pygments
+pypdf
