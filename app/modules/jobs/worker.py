@@ -323,6 +323,8 @@ def _build_pdf_from_repository(repo_url: str) -> bytes:
         readme_path = _find_readme(extract_dir)
         markdown_text = readme_path.read_text(encoding="utf-8", errors="replace")
         python_files = _find_python_files(repo_root)
+        markdown_files = _find_markdown_files(repo_root, readme_path)
+        text_files = _find_text_files(repo_root)
         repo_name = _repo_name_from_url(repo_url)
         return _render_repository_pdf(
             repo_name=repo_name,
@@ -331,6 +333,8 @@ def _build_pdf_from_repository(repo_url: str) -> bytes:
             asset_root=readme_path.parent,
             repo_root=repo_root,
             python_files=python_files,
+            markdown_files=markdown_files,
+            text_files=text_files,
         )
 
 
@@ -385,7 +389,44 @@ def _find_repo_root(base_dir: Path) -> Path:
 
 
 def _find_python_files(repo_root: Path) -> list[Path]:
-    excluded_dirs = {
+    excluded_dirs = _excluded_dirs()
+    python_files = []
+    for path in repo_root.rglob("*.py"):
+        if any(part in excluded_dirs for part in path.parts):
+            continue
+        python_files.append(path)
+    return sorted(python_files)
+
+
+def _find_markdown_files(repo_root: Path, readme_path: Path) -> list[Path]:
+    excluded_dirs = _excluded_dirs()
+    markdown_files = []
+    readme_resolved = readme_path.resolve()
+    for path in repo_root.rglob("*.md"):
+        if any(part in excluded_dirs for part in path.parts):
+            continue
+        if path.resolve() == readme_resolved:
+            continue
+        markdown_files.append(path)
+    return sorted(markdown_files)
+
+
+def _find_text_files(repo_root: Path) -> list[Path]:
+    excluded_dirs = _excluded_dirs()
+    suffixes = {".toml", ".yaml", ".yml"}
+    text_files = []
+    for path in repo_root.rglob("*"):
+        if not path.is_file():
+            continue
+        if any(part in excluded_dirs for part in path.parts):
+            continue
+        if path.suffix.lower() in suffixes:
+            text_files.append(path)
+    return sorted(text_files)
+
+
+def _excluded_dirs() -> set[str]:
+    return {
         ".git",
         ".venv",
         "venv",
@@ -397,12 +438,6 @@ def _find_python_files(repo_root: Path) -> list[Path]:
         "dist",
         "build",
     }
-    python_files = []
-    for path in repo_root.rglob("*.py"):
-        if any(part in excluded_dirs for part in path.parts):
-            continue
-        python_files.append(path)
-    return sorted(python_files)
 
 
 def _repo_name_from_url(repo_url: str) -> str:
@@ -420,9 +455,27 @@ def _render_repository_pdf(
     asset_root: Path,
     repo_root: Path,
     python_files: list[Path],
+    markdown_files: list[Path],
+    text_files: list[Path],
 ) -> bytes:
     toc_entries = [
         {"id": "readme", "label": "README", "kind": "Documentation"},
+        *[
+            {
+                "id": f"markdown-file-{index}",
+                "label": path.relative_to(repo_root).as_posix(),
+                "kind": "Markdown",
+            }
+            for index, path in enumerate(markdown_files, start=1)
+        ],
+        *[
+            {
+                "id": f"text-file-{index}",
+                "label": path.relative_to(repo_root).as_posix(),
+                "kind": "Text Config",
+            }
+            for index, path in enumerate(text_files, start=1)
+        ],
         *[
             {
                 "id": f"python-file-{index}",
@@ -445,6 +498,8 @@ def _render_repository_pdf(
     {_build_cover_page(repo_name, repo_url, len(python_files))}
     {_build_table_of_contents(toc_entries)}
     {_build_readme_section(markdown_text, asset_root)}
+    {_build_markdown_sections(repo_root, markdown_files)}
+    {_build_text_sections(repo_root, text_files)}
     {_build_python_sections(repo_root, python_files)}
   </main>
 </body>
@@ -492,17 +547,7 @@ def _build_table_of_contents(toc_entries: list[dict[str, str]]) -> str:
 
 
 def _build_readme_section(markdown_text: str, asset_root: Path) -> str:
-    rendered_markdown = markdown(
-        markdown_text,
-        extensions=[
-            "extra",
-            "fenced_code",
-            "tables",
-            "toc",
-            "sane_lists",
-        ],
-        output_format="html5",
-    )
+    rendered_markdown = _render_markdown_html(markdown_text)
     return f"""
 <section class="page-break" id="readme">
   <h1>README</h1>
@@ -512,6 +557,57 @@ def _build_readme_section(markdown_text: str, asset_root: Path) -> str:
   </div>
 </section>
 """
+
+
+def _build_markdown_sections(repo_root: Path, markdown_files: list[Path]) -> str:
+    sections = []
+    for index, path in enumerate(markdown_files, start=1):
+        relative_path = path.relative_to(repo_root).as_posix()
+        file_id = f"markdown-file-{index}"
+        content = path.read_text(encoding="utf-8", errors="replace")
+        rendered_markdown = _render_markdown_html(content)
+        sections.append(
+            f"""
+<section class="page-break divider-page">
+  <p class="toc-kind">Upcoming Markdown File</p>
+  <h1>{html.escape(path.name)}</h1>
+  <p class="file-path">{html.escape(relative_path)}</p>
+</section>
+<section class="page-break" id="{file_id}">
+  <h1>{html.escape(path.name)}</h1>
+  <p class="file-path">{html.escape(relative_path)}</p>
+  <div class="markdown-body">
+    {rendered_markdown}
+  </div>
+</section>
+"""
+        )
+    return "".join(sections)
+
+
+def _build_text_sections(repo_root: Path, text_files: list[Path]) -> str:
+    sections = []
+    for index, path in enumerate(text_files, start=1):
+        relative_path = path.relative_to(repo_root).as_posix()
+        file_id = f"text-file-{index}"
+        content = path.read_text(encoding="utf-8", errors="replace")
+        sections.append(
+            f"""
+<section class="page-break divider-page">
+  <p class="toc-kind">Upcoming Text File</p>
+  <h1>{html.escape(path.name)}</h1>
+  <p class="file-path">{html.escape(relative_path)}</p>
+</section>
+<section class="page-break" id="{file_id}">
+  <h1>{html.escape(path.name)}</h1>
+  <p class="file-path">{html.escape(relative_path)}</p>
+  <div class="codehilite">
+    <pre>{html.escape(content)}</pre>
+  </div>
+</section>
+"""
+        )
+    return "".join(sections)
 
 
 def _build_python_sections(repo_root: Path, python_files: list[Path]) -> str:
@@ -536,6 +632,20 @@ def _build_python_sections(repo_root: Path, python_files: list[Path]) -> str:
 """
         )
     return "".join(sections)
+
+
+def _render_markdown_html(markdown_text: str) -> str:
+    return markdown(
+        markdown_text,
+        extensions=[
+            "extra",
+            "fenced_code",
+            "tables",
+            "toc",
+            "sane_lists",
+        ],
+        output_format="html5",
+    )
 
 
 def _store_pdf(db, user_id: int, pdf_bytes: bytes) -> File:
