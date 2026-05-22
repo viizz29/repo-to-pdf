@@ -29,7 +29,7 @@ PYTHON_FORMATTER = HtmlFormatter(cssclass="codehilite", linenos=True)
 
 
 README_PDF_CSS = CSS(
-    string=f"""
+    string="""
     @page {
       size: A4;
       margin: 20mm 16mm;
@@ -257,9 +257,8 @@ README_PDF_CSS = CSS(
     .codehilite .highlight {
       padding: 14px 16px;
     }
-
-    {PYTHON_FORMATTER.get_style_defs(".codehilite")}
     """
+    + PYTHON_FORMATTER.get_style_defs(".codehilite")
 )
 
 
@@ -455,23 +454,27 @@ def _build_cover_page(repo_name: str, repo_url: str, python_file_count: int) -> 
 
 
 def _build_table_of_contents(toc_entries: list[dict[str, str]]) -> str:
-    items = "".join(
-        f"""
+    items = []
+    for entry in toc_entries:
+        item_id = html.escape(entry["id"])
+        item_label = html.escape(entry["label"])
+        item_kind = html.escape(entry["kind"])
+        items.append(
+            f"""
 <li>
-  <a href="#{entry["id"]}">
-    <span class="toc-label">{html.escape(entry["label"])}</span>
-    <span class="toc-kind">{html.escape(entry["kind"])}</span>
+  <a href="#{item_id}">
+    <span class="toc-label">{item_label}</span>
+    <span class="toc-kind">{item_kind}</span>
   </a>
 </li>
 """
-        for entry in toc_entries
-    )
+        )
     return f"""
 <section class="page-break" id="table-of-contents">
   <h1>Table of Contents</h1>
   <p class="toc-meta">Sections included in this generated PDF.</p>
   <ol class="toc-list">
-    {items}
+    {"".join(items)}
   </ol>
 </section>
 """
