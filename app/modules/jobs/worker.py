@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import logging
 import threading
 import urllib.parse
@@ -12,6 +13,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from markdown import markdown
+from pygments import highlight
+from pygments.formatters import HtmlFormatter
+from pygments.lexers import PythonLexer
 from weasyprint import CSS, HTML
 
 from app.core.database import SessionLocal
@@ -21,10 +25,11 @@ from app.modules.files.model import File, LocalFile
 from .model import Job
 
 logger = logging.getLogger(__name__)
+PYTHON_FORMATTER = HtmlFormatter(cssclass="codehilite", linenos=True)
 
 
 README_PDF_CSS = CSS(
-    string="""
+    string=f"""
     @page {
       size: A4;
       margin: 20mm 16mm;
@@ -55,6 +60,76 @@ README_PDF_CSS = CSS(
 
     main {
       max-width: 100%;
+    }
+
+    .cover-page,
+    .divider-page {
+      min-height: 250mm;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+
+    .page-break {
+      page-break-before: always;
+      break-before: page;
+    }
+
+    .cover-page h1,
+    .divider-page h1 {
+      border-bottom: 0;
+      padding-bottom: 0;
+      margin-bottom: 0.2em;
+    }
+
+    .cover-page p,
+    .divider-page p,
+    .toc-meta {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .toc-list {
+      list-style: none;
+      padding-left: 0;
+      margin: 0;
+    }
+
+    .toc-list li {
+      margin: 0 0 0.7em;
+      padding-bottom: 0.7em;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .toc-list a {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      color: inherit;
+    }
+
+    .toc-label {
+      font-weight: 600;
+    }
+
+    .toc-kind {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      white-space: nowrap;
+    }
+
+    .section-intro {
+      color: var(--muted);
+      margin-bottom: 2em;
+    }
+
+    .file-path {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 14px;
+      color: var(--muted);
+      margin: 0;
     }
 
     h1, h2, h3, h4, h5, h6 {
@@ -139,6 +214,51 @@ README_PDF_CSS = CSS(
       vertical-align: top;
       text-align: left;
     }
+
+    .codehilite {
+      background: var(--code-bg);
+      border-radius: 8px;
+      overflow: hidden;
+      margin: 0 0 1em;
+    }
+
+    .codehilite pre {
+      margin: 0;
+      border-radius: 0;
+      background: transparent;
+    }
+
+    .codehilite table {
+      margin: 0;
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .codehilite td {
+      border: 0;
+      padding: 0;
+      vertical-align: top;
+    }
+
+    .codehilite .linenos {
+      width: 1%;
+      white-space: pre;
+      user-select: none;
+      color: var(--muted);
+      border-right: 1px solid var(--border);
+      padding: 14px 12px;
+    }
+
+    .codehilite .linenodiv pre,
+    .codehilite .highlight pre {
+      margin: 0;
+    }
+
+    .codehilite .highlight {
+      padding: 14px 16px;
+    }
+
+    {PYTHON_FORMATTER.get_style_defs(".codehilite")}
     """
 )
 
@@ -189,9 +309,19 @@ def _build_pdf_from_repository(repo_url: str) -> bytes:
         with zipfile.ZipFile(archive_path, "r") as zip_file:
             zip_file.extractall(extract_dir)
 
+        repo_root = _find_repo_root(extract_dir)
         readme_path = _find_readme(extract_dir)
         markdown_text = readme_path.read_text(encoding="utf-8", errors="replace")
-        return _render_markdown_pdf(markdown_text, readme_path.parent)
+        python_files = _find_python_files(repo_root)
+        repo_name = _repo_name_from_url(repo_url)
+        return _render_repository_pdf(
+            repo_name=repo_name,
+            repo_url=repo_url,
+            markdown_text=markdown_text,
+            asset_root=readme_path.parent,
+            repo_root=repo_root,
+            python_files=python_files,
+        )
 
 
 def _build_archive_url(repo_url: str) -> str:
@@ -237,7 +367,117 @@ def _find_readme(base_dir: Path) -> Path:
     return matches[0]
 
 
-def _render_markdown_pdf(markdown_text: str, asset_root: Path) -> bytes:
+def _find_repo_root(base_dir: Path) -> Path:
+    directories = [path for path in base_dir.iterdir() if path.is_dir()]
+    if len(directories) == 1:
+        return directories[0]
+    return base_dir
+
+
+def _find_python_files(repo_root: Path) -> list[Path]:
+    excluded_dirs = {
+        ".git",
+        ".venv",
+        "venv",
+        "__pycache__",
+        "node_modules",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".tox",
+        "dist",
+        "build",
+    }
+    python_files = []
+    for path in repo_root.rglob("*.py"):
+        if any(part in excluded_dirs for part in path.parts):
+            continue
+        python_files.append(path)
+    return sorted(python_files)
+
+
+def _repo_name_from_url(repo_url: str) -> str:
+    parsed = urllib.parse.urlparse(repo_url)
+    repo_name = parsed.path.rstrip("/").rsplit("/", 1)[-1]
+    if repo_name.endswith(".git"):
+        repo_name = repo_name[:-4]
+    return repo_name or "repository"
+
+
+def _render_repository_pdf(
+    repo_name: str,
+    repo_url: str,
+    markdown_text: str,
+    asset_root: Path,
+    repo_root: Path,
+    python_files: list[Path],
+) -> bytes:
+    toc_entries = [
+        {"id": "readme", "label": "README", "kind": "Documentation"},
+        *[
+            {
+                "id": f"python-file-{index}",
+                "label": path.relative_to(repo_root).as_posix(),
+                "kind": "Python Source",
+            }
+            for index, path in enumerate(python_files, start=1)
+        ],
+    ]
+
+    html_document = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(repo_name)}</title>
+</head>
+<body>
+  <main class="document">
+    {_build_cover_page(repo_name, repo_url, len(python_files))}
+    {_build_table_of_contents(toc_entries)}
+    {_build_readme_section(markdown_text, asset_root)}
+    {_build_python_sections(repo_root, python_files)}
+  </main>
+</body>
+</html>
+"""
+    return HTML(string=html_document, base_url=str(asset_root)).write_pdf(stylesheets=[README_PDF_CSS])
+
+
+def _build_cover_page(repo_name: str, repo_url: str, python_file_count: int) -> str:
+    return f"""
+<section class="cover-page">
+  <p class="toc-kind">Repository Export</p>
+  <h1>{html.escape(repo_name)}</h1>
+  <p>{html.escape(repo_url)}</p>
+  <p>Includes README and {python_file_count} Python file(s).</p>
+</section>
+"""
+
+
+def _build_table_of_contents(toc_entries: list[dict[str, str]]) -> str:
+    items = "".join(
+        f"""
+<li>
+  <a href="#{entry["id"]}">
+    <span class="toc-label">{html.escape(entry["label"])}</span>
+    <span class="toc-kind">{html.escape(entry["kind"])}</span>
+  </a>
+</li>
+"""
+        for entry in toc_entries
+    )
+    return f"""
+<section class="page-break" id="table-of-contents">
+  <h1>Table of Contents</h1>
+  <p class="toc-meta">Sections included in this generated PDF.</p>
+  <ol class="toc-list">
+    {items}
+  </ol>
+</section>
+"""
+
+
+def _build_readme_section(markdown_text: str, asset_root: Path) -> str:
     rendered_markdown = markdown(
         markdown_text,
         extensions=[
@@ -249,21 +489,39 @@ def _render_markdown_pdf(markdown_text: str, asset_root: Path) -> bytes:
         ],
         output_format="html5",
     )
-    html_document = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>README</title>
-</head>
-<body>
-  <main class="markdown-body">
+    return f"""
+<section class="page-break" id="readme">
+  <h1>README</h1>
+  <p class="section-intro">Repository documentation rendered from <code>README.md</code>.</p>
+  <div class="markdown-body">
     {rendered_markdown}
-  </main>
-</body>
-</html>
+  </div>
+</section>
 """
-    return HTML(string=html_document, base_url=str(asset_root)).write_pdf(stylesheets=[README_PDF_CSS])
+
+
+def _build_python_sections(repo_root: Path, python_files: list[Path]) -> str:
+    sections = []
+    for index, path in enumerate(python_files, start=1):
+        relative_path = path.relative_to(repo_root).as_posix()
+        file_id = f"python-file-{index}"
+        source = path.read_text(encoding="utf-8", errors="replace")
+        highlighted = highlight(source, PythonLexer(), PYTHON_FORMATTER)
+        sections.append(
+            f"""
+<section class="page-break divider-page">
+  <p class="toc-kind">Upcoming File</p>
+  <h1>{html.escape(path.name)}</h1>
+  <p class="file-path">{html.escape(relative_path)}</p>
+</section>
+<section class="page-break" id="{file_id}">
+  <h1>{html.escape(path.name)}</h1>
+  <p class="file-path">{html.escape(relative_path)}</p>
+  {highlighted}
+</section>
+"""
+        )
+    return "".join(sections)
 
 
 def _store_pdf(db, user_id: int, pdf_bytes: bytes) -> File:
