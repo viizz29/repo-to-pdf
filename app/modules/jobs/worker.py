@@ -10,7 +10,6 @@ import urllib.request
 import uuid
 import zipfile
 from datetime import datetime
-from html.parser import HTMLParser
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -465,53 +464,6 @@ def _extract_unique_urls(markdown_text: str) -> list[str]:
     return found
 
 
-class _HtmlTextExtractor(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.in_title = False
-        self.in_script = False
-        self.in_style = False
-        self.title_parts: list[str] = []
-        self.text_parts: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs) -> None:
-        lowered = tag.lower()
-        if lowered == "title":
-            self.in_title = True
-        elif lowered == "script":
-            self.in_script = True
-        elif lowered == "style":
-            self.in_style = True
-        elif lowered in {"p", "div", "section", "article", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6"}:
-            self.text_parts.append("\n")
-
-    def handle_endtag(self, tag: str) -> None:
-        lowered = tag.lower()
-        if lowered == "title":
-            self.in_title = False
-        elif lowered == "script":
-            self.in_script = False
-        elif lowered == "style":
-            self.in_style = False
-        elif lowered in {"p", "div", "section", "article", "li", "h1", "h2", "h3", "h4", "h5", "h6"}:
-            self.text_parts.append("\n")
-
-    def handle_data(self, data: str) -> None:
-        if self.in_title:
-            self.title_parts.append(data)
-        if self.in_script or self.in_style:
-            return
-        if data.strip():
-            self.text_parts.append(data.strip())
-
-    def result(self) -> tuple[str, str]:
-        title = " ".join(part.strip() for part in self.title_parts if part.strip())
-        text = "\n".join(part for part in self.text_parts if part)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        text = re.sub(r"[ \t]+", " ", text)
-        return title.strip(), text.strip()
-
-
 def _fetch_html_pages(urls: list[str]) -> list[dict[str, str]]:
     pages = []
     for url in urls:
@@ -538,16 +490,15 @@ def _fetch_html_page(url: str) -> dict[str, str] | None:
         logger.warning("Failed to fetch linked page %s", url, exc_info=True)
         return None
 
-    parser = _HtmlTextExtractor()
-    parser.feed(html_content)
-    title, text_content = parser.result()
-    if not text_content:
-        return None
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html_content, flags=re.IGNORECASE | re.DOTALL)
+    title = ""
+    if title_match:
+        title = re.sub(r"\s+", " ", title_match.group(1)).strip()
 
     return {
         "url": url,
         "title": title or urllib.parse.urlparse(url).netloc or url,
-        "content": text_content[:50000],
+        "html": html_content,
     }
 
 
@@ -615,7 +566,23 @@ def _render_repository_pdf(
 </body>
 </html>
 """
-    return HTML(string=html_document, base_url=str(asset_root)).write_pdf(stylesheets=[README_PDF_CSS])
+    main_document = HTML(string=html_document, base_url=str(asset_root)).render(stylesheets=[README_PDF_CSS])
+    all_pages = list(main_document.pages)
+
+    for index, page in enumerate(linked_pages, start=1):
+        divider_document = HTML(
+            string=_build_linked_page_divider(page["title"], page["url"], index),
+            base_url=page["url"],
+        ).render(stylesheets=[README_PDF_CSS])
+        all_pages.extend(divider_document.pages)
+
+        try:
+            linked_document = HTML(string=page["html"], base_url=page["url"]).render()
+            all_pages.extend(linked_document.pages)
+        except Exception:
+            logger.warning("Failed to render linked HTML page %s", page["url"], exc_info=True)
+
+    return main_document.copy(all_pages).write_pdf()
 
 
 def _build_cover_page(repo_name: str, repo_url: str, python_file_count: int) -> str:
@@ -673,30 +640,28 @@ def _build_linked_pages_section(linked_pages: list[dict[str, str]]) -> str:
     if not linked_pages:
         return ""
 
-    sections = []
+    items = []
     for index, page in enumerate(linked_pages, start=1):
-        content_html = _text_to_paragraphs(page["content"])
-        sections.append(
+        items.append(
             f"""
-<section class="page-break divider-page">
-  <p class="toc-kind">Upcoming Linked Page</p>
-  <h1>{html.escape(page["title"])}</h1>
-  <p class="file-path">{html.escape(page["url"])}</p>
-</section>
-<section class="page-break" id="linked-page-{index}">
-  <h1>{html.escape(page["title"])}</h1>
-  <p class="section-intro"><a href="{html.escape(page["url"])}">{html.escape(page["url"])}</a></p>
-  {content_html}
-</section>
+<li>
+  <a href="#linked-page-{index}">
+    <span class="toc-label">{html.escape(page["title"])}</span>
+    <span class="toc-kind">HTML Page</span>
+  </a>
+  <div class="file-path">{html.escape(page["url"])}</div>
+</li>
 """
         )
 
     return f"""
 <section class="page-break" id="linked-pages">
   <h1>Linked HTML Pages</h1>
-  <p class="section-intro">HTML pages referenced from <code>README.md</code> and fetched into this export.</p>
+  <p class="section-intro">HTML pages referenced from <code>README.md</code> and rendered into this export.</p>
+  <ol class="toc-list">
+    {"".join(items)}
+  </ol>
 </section>
-{"".join(sections)}
 """
 
 
@@ -789,9 +754,25 @@ def _render_markdown_html(markdown_text: str) -> str:
     )
 
 
-def _text_to_paragraphs(text: str) -> str:
-    blocks = [block.strip() for block in text.split("\n\n") if block.strip()]
-    return "".join(f"<p>{html.escape(block)}</p>" for block in blocks)
+def _build_linked_page_divider(title: str, url: str, index: int) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)}</title>
+</head>
+<body>
+  <main>
+    <section class="page-break divider-page" id="linked-page-{index}">
+      <p class="toc-kind">Upcoming Linked Page</p>
+      <h1>{html.escape(title)}</h1>
+      <p class="file-path">{html.escape(url)}</p>
+    </section>
+  </main>
+</body>
+</html>
+"""
 
 
 def _store_pdf(db, user_id: int, pdf_bytes: bytes) -> File:
