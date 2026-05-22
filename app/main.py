@@ -12,7 +12,7 @@ from app.modules.jobs.router import router as jobs_router
 from app.modules.test.router import router as test_router
 
 import logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 
 
 DOCS_URL = "/docs"
