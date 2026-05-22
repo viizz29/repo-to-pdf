@@ -5,6 +5,7 @@ import html
 import io
 import logging
 import re
+import subprocess
 import threading
 import urllib.parse
 import urllib.request
@@ -341,6 +342,7 @@ def _build_pdf_from_repository(repo_url: str) -> bytes:
             python_files=python_files,
             markdown_files=markdown_files,
             text_files=text_files,
+            work_dir=temp_path,
         )
         return _merge_pdf_parts(pdf_parts)
 
@@ -515,6 +517,7 @@ def _build_repository_pdf_parts(
     python_files: list[Path],
     markdown_files: list[Path],
     text_files: list[Path],
+    work_dir: Path,
 ) -> list[bytes]:
     toc_entries = [
         {"id": "readme", "label": "README", "kind": "Documentation"},
@@ -571,11 +574,7 @@ def _build_repository_pdf_parts(
         pdf_parts.append(_render_pdf_html(_build_linked_pages_section(linked_pages), asset_root))
 
     for index, page in enumerate(linked_pages, start=1):
-        pdf_parts.append(_render_pdf_html(_build_linked_page_divider(page["title"], page["url"], index), page["url"]))
-        try:
-            pdf_parts.append(HTML(string=page["html"], base_url=page["url"]).write_pdf())
-        except Exception:
-            logger.warning("Failed to render linked HTML page %s", page["url"], exc_info=True)
+        pdf_parts.append(_render_linked_page_pdf(page, index, work_dir))
 
     for index, path in enumerate(markdown_files, start=1):
         pdf_parts.append(_render_markdown_file_pdf(repo_root, path, index))
@@ -603,6 +602,43 @@ def _merge_pdf_parts(pdf_parts: list[bytes]) -> bytes:
     output = io.BytesIO()
     writer.write(output)
     return output.getvalue()
+
+
+def _render_linked_page_pdf(page: dict[str, str], index: int, work_dir: Path) -> bytes:
+    divider_pdf = _render_pdf_html(_build_linked_page_divider(page["title"], page["url"], index), page["url"])
+    try:
+        page_pdf = _render_external_page_pdf_chromium(page["url"], index, work_dir)
+    except Exception:
+        logger.warning("Failed to render linked HTML page with Chromium %s", page["url"], exc_info=True)
+        page_pdf = HTML(string=page["html"], base_url=page["url"]).write_pdf()
+    return _merge_pdf_parts([divider_pdf, page_pdf])
+
+
+def _render_external_page_pdf_chromium(url: str, index: int, work_dir: Path) -> bytes:
+    chromium_dir = work_dir / "chromium"
+    chromium_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = chromium_dir / f"linked-page-{index}.pdf"
+    profile_dir = chromium_dir / f"profile-{index}"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    command = [
+        settings.BROWSER_BINARY,
+        "--headless",
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+        f"--user-data-dir={profile_dir}",
+        f"--print-to-pdf={output_path}",
+        url,
+    ]
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0 or not output_path.exists():
+        raise RuntimeError(
+            f"Chromium render failed for {url}: returncode={result.returncode} "
+            f"stderr={result.stderr.strip()} stdout={result.stdout.strip()}"
+        )
+    return output_path.read_bytes()
 
 
 def _build_cover_page(repo_name: str, repo_url: str, python_file_count: int) -> str:
