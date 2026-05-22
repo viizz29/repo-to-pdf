@@ -25,7 +25,7 @@ from app.modules.files.model import File, LocalFile
 from .model import Job
 
 logger = logging.getLogger(__name__)
-PYTHON_FORMATTER = HtmlFormatter(cssclass="codehilite", linenos=True)
+PYTHON_FORMATTER = HtmlFormatter(cssclass="codehilite", linenos="inline")
 
 
 README_PDF_CSS = CSS(
@@ -256,6 +256,17 @@ README_PDF_CSS = CSS(
 
     .codehilite .highlight {
       padding: 14px 16px;
+    }
+
+    .codehilite pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .codehilite .linenos {
+      color: var(--muted);
+      user-select: none;
+      margin-right: 1em;
     }
     """
     + PYTHON_FORMATTER.get_style_defs(".codehilite")
