@@ -10,6 +10,7 @@ import urllib.request
 import uuid
 import zipfile
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -324,6 +325,7 @@ def _build_pdf_from_repository(repo_url: str) -> bytes:
         readme_path = _find_readme(extract_dir)
         markdown_text = readme_path.read_text(encoding="utf-8", errors="replace")
         readme_urls = _extract_unique_urls(markdown_text)
+        linked_pages = _fetch_html_pages(readme_urls)
         python_files = _find_python_files(repo_root)
         markdown_files = _find_markdown_files(repo_root, readme_path)
         text_files = _find_text_files(repo_root)
@@ -332,7 +334,7 @@ def _build_pdf_from_repository(repo_url: str) -> bytes:
             repo_name=repo_name,
             repo_url=repo_url,
             markdown_text=markdown_text,
-            readme_urls=readme_urls,
+            linked_pages=linked_pages,
             asset_root=readme_path.parent,
             repo_root=repo_root,
             python_files=python_files,
@@ -463,11 +465,97 @@ def _extract_unique_urls(markdown_text: str) -> list[str]:
     return found
 
 
+class _HtmlTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_title = False
+        self.in_script = False
+        self.in_style = False
+        self.title_parts: list[str] = []
+        self.text_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        lowered = tag.lower()
+        if lowered == "title":
+            self.in_title = True
+        elif lowered == "script":
+            self.in_script = True
+        elif lowered == "style":
+            self.in_style = True
+        elif lowered in {"p", "div", "section", "article", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6"}:
+            self.text_parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.lower()
+        if lowered == "title":
+            self.in_title = False
+        elif lowered == "script":
+            self.in_script = False
+        elif lowered == "style":
+            self.in_style = False
+        elif lowered in {"p", "div", "section", "article", "li", "h1", "h2", "h3", "h4", "h5", "h6"}:
+            self.text_parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self.in_title:
+            self.title_parts.append(data)
+        if self.in_script or self.in_style:
+            return
+        if data.strip():
+            self.text_parts.append(data.strip())
+
+    def result(self) -> tuple[str, str]:
+        title = " ".join(part.strip() for part in self.title_parts if part.strip())
+        text = "\n".join(part for part in self.text_parts if part)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"[ \t]+", " ", text)
+        return title.strip(), text.strip()
+
+
+def _fetch_html_pages(urls: list[str]) -> list[dict[str, str]]:
+    pages = []
+    for url in urls:
+        page = _fetch_html_page(url)
+        if page is not None:
+            pages.append(page)
+    return pages
+
+
+def _fetch_html_page(url: str) -> dict[str, str] | None:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "repo-to-pdf/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            content_type = response.headers.get_content_type()
+            if content_type not in {"text/html", "application/xhtml+xml"}:
+                return None
+
+            charset = response.headers.get_content_charset() or "utf-8"
+            html_content = response.read().decode(charset, errors="replace")
+    except Exception:
+        logger.warning("Failed to fetch linked page %s", url, exc_info=True)
+        return None
+
+    parser = _HtmlTextExtractor()
+    parser.feed(html_content)
+    title, text_content = parser.result()
+    if not text_content:
+        return None
+
+    return {
+        "url": url,
+        "title": title or urllib.parse.urlparse(url).netloc or url,
+        "content": text_content[:50000],
+    }
+
+
 def _render_repository_pdf(
     repo_name: str,
     repo_url: str,
     markdown_text: str,
-    readme_urls: list[str],
+    linked_pages: list[dict[str, str]],
     asset_root: Path,
     repo_root: Path,
     python_files: list[Path],
@@ -477,8 +565,8 @@ def _render_repository_pdf(
     toc_entries = [
         {"id": "readme", "label": "README", "kind": "Documentation"},
         *(
-            [{"id": "readme-urls", "label": "README URLs", "kind": "Links"}]
-            if readme_urls
+            [{"id": "linked-pages", "label": "Linked HTML Pages", "kind": "External"}]
+            if linked_pages
             else []
         ),
         *[
@@ -519,7 +607,7 @@ def _render_repository_pdf(
     {_build_cover_page(repo_name, repo_url, len(python_files))}
     {_build_table_of_contents(toc_entries)}
     {_build_readme_section(markdown_text, asset_root)}
-    {_build_readme_urls_section(readme_urls)}
+    {_build_linked_pages_section(linked_pages)}
     {_build_markdown_sections(repo_root, markdown_files)}
     {_build_text_sections(repo_root, text_files)}
     {_build_python_sections(repo_root, python_files)}
@@ -581,22 +669,34 @@ def _build_readme_section(markdown_text: str, asset_root: Path) -> str:
 """
 
 
-def _build_readme_urls_section(readme_urls: list[str]) -> str:
-    if not readme_urls:
+def _build_linked_pages_section(linked_pages: list[dict[str, str]]) -> str:
+    if not linked_pages:
         return ""
 
-    items = "".join(
-        f'<li><a href="{html.escape(url)}">{html.escape(url)}</a></li>'
-        for url in readme_urls
-    )
-    return f"""
-<section class="page-break" id="readme-urls">
-  <h1>README URLs</h1>
-  <p class="section-intro">Unique URLs mentioned in <code>README.md</code>.</p>
-  <ol>
-    {items}
-  </ol>
+    sections = []
+    for index, page in enumerate(linked_pages, start=1):
+        content_html = _text_to_paragraphs(page["content"])
+        sections.append(
+            f"""
+<section class="page-break divider-page">
+  <p class="toc-kind">Upcoming Linked Page</p>
+  <h1>{html.escape(page["title"])}</h1>
+  <p class="file-path">{html.escape(page["url"])}</p>
 </section>
+<section class="page-break" id="linked-page-{index}">
+  <h1>{html.escape(page["title"])}</h1>
+  <p class="section-intro"><a href="{html.escape(page["url"])}">{html.escape(page["url"])}</a></p>
+  {content_html}
+</section>
+"""
+        )
+
+    return f"""
+<section class="page-break" id="linked-pages">
+  <h1>Linked HTML Pages</h1>
+  <p class="section-intro">HTML pages referenced from <code>README.md</code> and fetched into this export.</p>
+</section>
+{"".join(sections)}
 """
 
 
@@ -687,6 +787,11 @@ def _render_markdown_html(markdown_text: str) -> str:
         ],
         output_format="html5",
     )
+
+
+def _text_to_paragraphs(text: str) -> str:
+    blocks = [block.strip() for block in text.split("\n\n") if block.strip()]
+    return "".join(f"<p>{html.escape(block)}</p>" for block in blocks)
 
 
 def _store_pdf(db, user_id: int, pdf_bytes: bytes) -> File:
