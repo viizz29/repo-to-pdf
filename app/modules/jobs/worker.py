@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import html
 import logging
+import re
 import threading
 import urllib.parse
 import urllib.request
@@ -322,6 +323,7 @@ def _build_pdf_from_repository(repo_url: str) -> bytes:
         repo_root = _find_repo_root(extract_dir)
         readme_path = _find_readme(extract_dir)
         markdown_text = readme_path.read_text(encoding="utf-8", errors="replace")
+        readme_urls = _extract_unique_urls(markdown_text)
         python_files = _find_python_files(repo_root)
         markdown_files = _find_markdown_files(repo_root, readme_path)
         text_files = _find_text_files(repo_root)
@@ -330,6 +332,7 @@ def _build_pdf_from_repository(repo_url: str) -> bytes:
             repo_name=repo_name,
             repo_url=repo_url,
             markdown_text=markdown_text,
+            readme_urls=readme_urls,
             asset_root=readme_path.parent,
             repo_root=repo_root,
             python_files=python_files,
@@ -448,10 +451,23 @@ def _repo_name_from_url(repo_url: str) -> str:
     return repo_name or "repository"
 
 
+def _extract_unique_urls(markdown_text: str) -> list[str]:
+    url_pattern = re.compile(r"https?://[^\s<>()\]\[\"']+")
+    found = []
+    seen = set()
+    for match in url_pattern.findall(markdown_text):
+        cleaned = match.rstrip(".,;:!?")
+        if cleaned not in seen:
+            seen.add(cleaned)
+            found.append(cleaned)
+    return found
+
+
 def _render_repository_pdf(
     repo_name: str,
     repo_url: str,
     markdown_text: str,
+    readme_urls: list[str],
     asset_root: Path,
     repo_root: Path,
     python_files: list[Path],
@@ -460,6 +476,11 @@ def _render_repository_pdf(
 ) -> bytes:
     toc_entries = [
         {"id": "readme", "label": "README", "kind": "Documentation"},
+        *(
+            [{"id": "readme-urls", "label": "README URLs", "kind": "Links"}]
+            if readme_urls
+            else []
+        ),
         *[
             {
                 "id": f"markdown-file-{index}",
@@ -498,6 +519,7 @@ def _render_repository_pdf(
     {_build_cover_page(repo_name, repo_url, len(python_files))}
     {_build_table_of_contents(toc_entries)}
     {_build_readme_section(markdown_text, asset_root)}
+    {_build_readme_urls_section(readme_urls)}
     {_build_markdown_sections(repo_root, markdown_files)}
     {_build_text_sections(repo_root, text_files)}
     {_build_python_sections(repo_root, python_files)}
@@ -555,6 +577,25 @@ def _build_readme_section(markdown_text: str, asset_root: Path) -> str:
   <div class="markdown-body">
     {rendered_markdown}
   </div>
+</section>
+"""
+
+
+def _build_readme_urls_section(readme_urls: list[str]) -> str:
+    if not readme_urls:
+        return ""
+
+    items = "".join(
+        f'<li><a href="{html.escape(url)}">{html.escape(url)}</a></li>'
+        for url in readme_urls
+    )
+    return f"""
+<section class="page-break" id="readme-urls">
+  <h1>README URLs</h1>
+  <p class="section-intro">Unique URLs mentioned in <code>README.md</code>.</p>
+  <ol>
+    {items}
+  </ol>
 </section>
 """
 
