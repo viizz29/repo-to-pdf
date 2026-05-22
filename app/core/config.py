@@ -14,7 +14,6 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     HASHIDS_SALT: str = "change-me"
     STORAGE_DIR: str = "images"
-    BROWSER_BINARY: str = "chromium-browser"
     FACE_MATCH_TOLERANCE: float = 0.48
     AZURE_OPENAI_API_KEY: str | None = None
     AZURE_OPENAI_ENDPOINT: str | None = None

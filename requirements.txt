@@ -9,3 +9,5 @@ passlib[bcrypt]
 alembic
 pydantic-settings
 hashids
+markdown
+weasyprint
